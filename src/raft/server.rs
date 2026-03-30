@@ -1,10 +1,13 @@
 use std::{cmp::min, sync::Arc, time::Instant};
 
-use anyhow::{Error, Ok};
+use anyhow::Error;
 
 use crate::raft::{
-    communication::{AppendEntriesResponse, LogEntry, RaftMessage, RequestVoteResponse},
-    node::{Node, NodeState},
+    communication::{
+        AppendEntries, AppendEntriesResponse, LogEntry, RaftMessage, RequestVote,
+        RequestVoteResponse,
+    },
+    node::{Node, NodeState, PersistentState},
 };
 
 pub struct RaftServer {
@@ -18,144 +21,135 @@ impl RaftServer {
 
     pub async fn append_log(&self, command: &str) -> Result<(), Error> {
         let mut ps = self.node.persistent_state.lock().await;
-        let entry = LogEntry {
-            index: ps.log.last().map(|e| e.index).unwrap_or(0) + 1,
+        let index = ps.log.last().map(|e| e.index).unwrap_or(0) + 1;
+        ps.log.push(LogEntry {
+            index,
             term: ps.cur_term,
             command: command.to_string(),
-        };
-        ps.log.push(entry);
-
+        });
         Ok(())
     }
 
-    pub async fn process_request(&self, raft_request: RaftMessage) -> Result<RaftMessage, Error> {
-        match raft_request {
-            RaftMessage::RequestVote(req) => {
-                let mut ps = self.node.persistent_state.lock().await;
-
-                // Step down if we see a higher term
-                let mut step_down = false;
-                if req.term > ps.cur_term {
-                    ps.cur_term = req.term;
-                    ps.voted_for = None;
-                    step_down = true;
-                }
-
-                // Reject if candidate's term is stale
-                if req.term < ps.cur_term {
-                    let term = ps.cur_term;
-                    drop(ps);
-                    if step_down {
-                        *self.node.state.lock().await = NodeState::Follower;
-                    }
-                    return Ok(RaftMessage::RequestVoteResponse(RequestVoteResponse {
-                        term,
-                        vote_granted: false,
-                    }));
-                }
-
-                // Check voted_for: haven't voted, or already voted for this candidate
-                let can_vote = ps.voted_for.is_none() || ps.voted_for == Some(req.node_id);
-
-                // Log freshness (Raft §5.4.1): compare terms first, then index
-                let my_last_term = ps.log.last().map(|e| e.term).unwrap_or(0);
-                let my_last_idx = ps.log.last().map(|e| e.index).unwrap_or(0);
-                let log_ok = req.last_log_term > my_last_term
-                    || (req.last_log_term == my_last_term && req.last_log_idx >= my_last_idx);
-
-                let response = if can_vote && log_ok {
-                    ps.voted_for = Some(req.node_id);
-                    RaftMessage::RequestVoteResponse(RequestVoteResponse {
-                        term: ps.cur_term,
-                        vote_granted: true,
-                    })
-                } else {
-                    RaftMessage::RequestVoteResponse(RequestVoteResponse {
-                        term: ps.cur_term,
-                        vote_granted: false,
-                    })
-                };
-
-                let _term = ps.cur_term;
-                drop(ps);
-                if step_down {
-                    *self.node.state.lock().await = NodeState::Follower;
-                }
-
-                Ok(response)
-            }
-
-            RaftMessage::AppendEntries(req) => {
-                let mut ps = self.node.persistent_state.lock().await;
-
-                let mut step_down = false;
-                if req.term > ps.cur_term {
-                    ps.cur_term = req.term;
-                    ps.voted_for = None;
-                    step_down = true;
-                }
-
-                if req.term < ps.cur_term {
-                    let term = ps.cur_term;
-                    drop(ps);
-                    if step_down {
-                        *self.node.state.lock().await = NodeState::Follower;
-                    }
-                    return Ok(RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
-                        term,
-                        success: false,
-                    }));
-                }
-
-                let term = ps.cur_term;
-
-                // Valid heartbeat — reset election timer and step down to Follower
-                *self.node.last_heartbeat.lock().await = Instant::now();
-                *self.node.state.lock().await = NodeState::Follower;
-
-                if ps.log.len() as u64 >= req.prev_log_index {
-                    if req.prev_log_index == 0
-                        || (ps.log[(req.prev_log_index as usize) - 1].term == req.prev_log_term)
-                    {
-                        for entry in req.entries {
-                            let idx = entry.index as usize - 1;
-                            if idx < ps.log.len() && ps.log[idx].term != entry.term {
-                                ps.log.truncate(idx);
-                                if idx >= ps.log.len() {
-                                    ps.log.push(entry);
-                                }
-                            }
-                        }
-
-                        let mut vol_state = self.node.volatile_state.lock().await;
-
-                        if req.leader_commit > vol_state.commit_idx {
-                            vol_state.commit_idx = min(
-                                req.leader_commit,
-                                ps.log.last().map(|e| e.index).unwrap_or(0),
-                            )
-                        }
-
-                        Ok(RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
-                            term,
-                            success: true,
-                        }))
-                    } else {
-                        Ok(RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
-                            term,
-                            success: false,
-                        }))
-                    }
-                } else {
-                    Ok(RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
-                        term,
-                        success: false,
-                    }))
-                }
-            }
-
-            // Responses are handled by the sender, not the server
-            _ => anyhow::bail!("unexpected message type in server handler"),
+    pub async fn process_request(&self, message: RaftMessage) -> Result<RaftMessage, Error> {
+        match message {
+            RaftMessage::RequestVote(req) => self.handle_request_vote(req).await,
+            RaftMessage::AppendEntries(req) => self.handle_append_entries(req).await,
+            _ => anyhow::bail!("unexpected message type"),
         }
     }
+
+    // ── RequestVote ──────────────────────────────────────────────
+
+    async fn handle_request_vote(&self, req: RequestVote) -> Result<RaftMessage, Error> {
+        let mut ps = self.node.persistent_state.lock().await;
+        self.step_down_if_stale(&mut ps, req.term).await;
+
+        if req.term < ps.cur_term {
+            return Ok(vote_response(ps.cur_term, false));
+        }
+
+        let available = ps.voted_for.is_none() || ps.voted_for == Some(req.node_id);
+        let up_to_date = is_log_up_to_date(&ps, req.last_log_term, req.last_log_idx);
+
+        if available && up_to_date {
+            ps.voted_for = Some(req.node_id);
+            Ok(vote_response(ps.cur_term, true))
+        } else {
+            Ok(vote_response(ps.cur_term, false))
+        }
+    }
+
+    // ── AppendEntries ────────────────────────────────────────────
+
+    async fn handle_append_entries(&self, req: AppendEntries) -> Result<RaftMessage, Error> {
+        let mut ps = self.node.persistent_state.lock().await;
+        self.step_down_if_stale(&mut ps, req.term).await;
+
+        if req.term < ps.cur_term {
+            return Ok(entries_response(ps.cur_term, false));
+        }
+
+        self.accept_leader().await;
+        let term = ps.cur_term;
+
+        // Log consistency check (Raft §5.3)
+        if !log_matches(&ps, req.prev_log_index, req.prev_log_term) {
+            return Ok(entries_response(term, false));
+        }
+
+        merge_entries(&mut ps, req.entries);
+
+        // Advance commit index
+        let mut vol = self.node.volatile_state.lock().await;
+        if req.leader_commit > vol.commit_idx {
+            vol.commit_idx = min(
+                req.leader_commit,
+                ps.log.last().map(|e| e.index).unwrap_or(0),
+            );
+        }
+
+        Ok(entries_response(term, true))
+    }
+
+    // ── State transitions ────────────────────────────────────────
+
+    /// If `incoming_term` is newer, adopt it and revert to Follower.
+    async fn step_down_if_stale(&self, ps: &mut PersistentState, incoming_term: u64) {
+        if incoming_term > ps.cur_term {
+            ps.cur_term = incoming_term;
+            ps.voted_for = None;
+            *self.node.state.lock().await = NodeState::Follower;
+        }
+    }
+
+    /// Acknowledge a valid leader: reset heartbeat timer and become Follower.
+    async fn accept_leader(&self) {
+        *self.node.last_heartbeat.lock().await = Instant::now();
+        *self.node.state.lock().await = NodeState::Follower;
+    }
+}
+
+// ── Pure helpers (no state needed) ───────────────────────────────
+
+/// Raft §5.4.1 — candidate's log must be at least as up-to-date as ours.
+fn is_log_up_to_date(ps: &PersistentState, candidate_term: u64, candidate_idx: u64) -> bool {
+    let my_term = ps.log.last().map(|e| e.term).unwrap_or(0);
+    let my_idx = ps.log.last().map(|e| e.index).unwrap_or(0);
+    candidate_term > my_term || (candidate_term == my_term && candidate_idx >= my_idx)
+}
+
+/// Raft §5.3 — check that our log contains an entry at `prev_index` with `prev_term`.
+fn log_matches(ps: &PersistentState, prev_index: u64, prev_term: u64) -> bool {
+    if prev_index == 0 {
+        return true;
+    }
+    ps.log
+        .get(prev_index as usize - 1)
+        .is_some_and(|e| e.term == prev_term)
+}
+
+/// Raft §5.3 — append new entries, truncating the log on conflict.
+fn merge_entries(ps: &mut PersistentState, entries: Vec<LogEntry>) {
+    for entry in entries {
+        let idx = entry.index as usize - 1;
+        if idx < ps.log.len() {
+            if ps.log[idx].term != entry.term {
+                ps.log.truncate(idx);
+                ps.log.push(entry);
+            }
+        } else {
+            ps.log.push(entry);
+        }
+    }
+}
+
+fn vote_response(term: u64, granted: bool) -> RaftMessage {
+    RaftMessage::RequestVoteResponse(RequestVoteResponse {
+        term,
+        vote_granted: granted,
+    })
+}
+
+fn entries_response(term: u64, success: bool) -> RaftMessage {
+    RaftMessage::AppendEntriesResponse(AppendEntriesResponse { term, success })
 }

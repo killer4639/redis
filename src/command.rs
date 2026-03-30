@@ -1,4 +1,6 @@
+use crate::Server;
 use crate::memory::{Store, StoreError};
+use crate::raft::node::{Node, NodeState};
 use crate::resp::RespValue;
 use std::time::Duration;
 
@@ -23,6 +25,17 @@ pub enum Command {
     HGet,
     HGetAll,
     HDel,
+}
+
+/// Reconstructs the full Redis command as a string (e.g. "SET key value EX 10").
+fn get_raw_command(command: &Command, args: &[RespValue]) -> String {
+    let mut parts = vec![command.name().to_string()];
+    for arg in args {
+        if let Some(s) = arg.as_str() {
+            parts.push(s.to_string());
+        }
+    }
+    parts.join(" ")
 }
 
 impl Command {
@@ -52,12 +65,65 @@ impl Command {
         }
     }
 
+    pub fn is_write_command(&self) -> bool {
+        matches!(
+            self,
+            Self::Set
+                | Self::Del
+                | Self::Expire
+                | Self::LPush
+                | Self::RPush
+                | Self::LPop
+                | Self::RPop
+                | Self::HSet
+                | Self::HDel
+        )
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Ping => "PING",
+            Self::Echo => "ECHO",
+            Self::Set => "SET",
+            Self::Get => "GET",
+            Self::Del => "DEL",
+            Self::Exists => "EXISTS",
+            Self::Expire => "EXPIRE",
+            Self::Ttl => "TTL",
+            Self::Pttl => "PTTL",
+            Self::LPush => "LPUSH",
+            Self::RPush => "RPUSH",
+            Self::LPop => "LPOP",
+            Self::RPop => "RPOP",
+            Self::LRange => "LRANGE",
+            Self::LLen => "LLEN",
+            Self::HSet => "HSET",
+            Self::HGet => "HGET",
+            Self::HGetAll => "HGETALL",
+            Self::HDel => "HDEL",
+        }
+    }
+
     /// Executes the command with the given arguments against the store.
     /// Returns a RespValue response ready to send to the client.
-    pub fn execute(&self, args: &[RespValue], store: &Store) -> RespValue {
-        match self.execute_inner(args, store) {
-            Ok(response) => response,
-            Err(err_response) => err_response,
+    pub async fn execute(&self, args: &[RespValue], server: &Server) -> RespValue {
+        if self.is_write_command() {
+            if !matches!(*server.raft.node.state.lock().await, NodeState::Leader) {
+                return RespValue::Error("Not the leader".to_string())
+            }
+            let raw_command = get_raw_command(self, args);
+            match server.raft.append_log(&raw_command).await {
+                Ok(()) => {
+                    // TODO: execute after Raft commit
+                    RespValue::ok()
+                }
+                Err(e) => RespValue::err(&format!("RAFT {e}")),
+            }
+        } else {
+            match self.execute_inner(args, &server.redis) {
+                Ok(response) => response,
+                Err(err_response) => err_response,
+            }
         }
     }
 
@@ -139,19 +205,17 @@ impl Command {
                 Self::require_min_args("LPUSH", args, 2)?;
                 let key = Self::parse_string_arg(&args[0], "key")?;
                 let values = Self::parse_string_args(&args[1..], "list element")?;
-                Ok(RespValue::Integer(Self::map_store_error(store.lpush(
-                    key,
-                    &values,
-                ))?))
+                Ok(RespValue::Integer(Self::map_store_error(
+                    store.lpush(key, &values),
+                )?))
             }
             Self::RPush => {
                 Self::require_min_args("RPUSH", args, 2)?;
                 let key = Self::parse_string_arg(&args[0], "key")?;
                 let values = Self::parse_string_args(&args[1..], "list element")?;
-                Ok(RespValue::Integer(Self::map_store_error(store.rpush(
-                    key,
-                    &values,
-                ))?))
+                Ok(RespValue::Integer(Self::map_store_error(
+                    store.rpush(key, &values),
+                )?))
             }
             Self::LPop => {
                 Self::require_exact_args("LPOP", args, 1)?;
@@ -200,10 +264,9 @@ impl Command {
                     .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
                     .collect();
 
-                Ok(RespValue::Integer(Self::map_store_error(store.hset(
-                    key,
-                    &pairs,
-                ))?))
+                Ok(RespValue::Integer(Self::map_store_error(
+                    store.hset(key, &pairs),
+                )?))
             }
             Self::HGet => {
                 Self::require_exact_args("HGET", args, 2)?;
@@ -229,10 +292,9 @@ impl Command {
                 Self::require_min_args("HDEL", args, 2)?;
                 let key = Self::parse_string_arg(&args[0], "key")?;
                 let fields = Self::parse_string_args(&args[1..], "field")?;
-                Ok(RespValue::Integer(Self::map_store_error(store.hdel(
-                    key,
-                    &fields,
-                ))?))
+                Ok(RespValue::Integer(Self::map_store_error(
+                    store.hdel(key, &fields),
+                )?))
             }
         }
     }
@@ -279,7 +341,11 @@ impl Command {
         }
     }
 
-    fn require_exact_args(name: &str, args: &[RespValue], expected: usize) -> Result<(), RespValue> {
+    fn require_exact_args(
+        name: &str,
+        args: &[RespValue],
+        expected: usize,
+    ) -> Result<(), RespValue> {
         if args.len() == expected {
             Ok(())
         } else {

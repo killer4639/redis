@@ -7,24 +7,37 @@ mod utils;
 
 use std::{env, sync::Arc};
 
-use anyhow::Result;
-use serde::Serialize;
+use anyhow::{Context, Result};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
-use crate::{command::Command, raft::server::RaftServer};
 use crate::{
+    command::Command,
     memory::Store,
-    raft::node::{self, Node},
+    raft::{communication::RaftMessage, node::Node, server::RaftServer},
+    resp::RespValue,
     utils::parse_peers,
 };
-use crate::{raft::communication::RequestVoteResponse, resp::RespValue};
+
+const REDIS_ADDR: &str = "0.0.0.0:6379";
+const RAFT_ADDR: &str = "0.0.0.0:6380";
+
+pub struct Server {
+    pub redis: Arc<Store>,
+    pub raft: Arc<RaftServer>,
+}
+
+impl Server {
+    pub fn new(redis: Arc<Store>, raft: Arc<RaftServer>) -> Self {
+        Self { redis, raft }
+    }
+}
 
 /// Handles a single client connection.
 /// Reads commands in a loop until the client disconnects.
-async fn handle_redis_connection(mut socket: TcpStream, store: Arc<Store>) {
+async fn handle_redis_connection(mut socket: TcpStream, server: Arc<Server>) {
     let peer = socket
         .peer_addr()
         .map(|a| a.to_string())
@@ -39,7 +52,7 @@ async fn handle_redis_connection(mut socket: TcpStream, store: Arc<Store>) {
             Err(_) => break, // read error, drop connection
         };
 
-        let response = process_request(&buf[..bytes_read], &store);
+        let response = process_redis_request(&buf[..bytes_read], &server).await;
         if socket
             .write_all(response.to_string().as_bytes())
             .await
@@ -69,9 +82,23 @@ async fn handle_raft_connection(mut socket: TcpStream, raft_server: Arc<RaftServ
             Err(_) => break, // read error, drop connection
         };
 
-        let response = RequestVoteResponse::default();
+        let raft_message: RaftMessage = match serde_json::from_slice(&buf[..bytes_read]) {
+            Ok(msg) => msg,
+            Err(e) => {
+                eprintln!("Invalid Raft message from {peer}: {e}");
+                continue;
+            }
+        };
+
+        let response = match raft_server.process_request(raft_message).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                eprintln!("Error processing Raft message from {peer}: {e}");
+                continue;
+            }
+        };
         if socket
-            .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+            .write_all(&serde_json::to_vec(&response).unwrap())
             .await
             .is_err()
         {
@@ -83,7 +110,7 @@ async fn handle_raft_connection(mut socket: TcpStream, raft_server: Arc<RaftServ
 }
 
 /// Parses and executes a single RESP request.
-fn process_request(buf: &[u8], store: &Store) -> RespValue {
+async fn process_redis_request(buf: &[u8], server: &Server) -> RespValue {
     let request = RespValue::deserialize(buf);
 
     let RespValue::Array(Some(items)) = request else {
@@ -103,41 +130,78 @@ fn process_request(buf: &[u8], store: &Store) -> RespValue {
     };
 
     // items[0] is the command name, the rest are arguments
-    command.execute(&items[1..], store)
+    command.execute(&items[1..], server).await
+}
+
+/// Parse node configuration from environment variables.
+fn load_config() -> Result<(u16, Vec<u16>)> {
+    let node_id: u16 = env::var("NODE_ID")
+        .context("NODE_ID env variable must be set")?
+        .parse()
+        .context("NODE_ID must be a valid u16")?;
+
+    let peers = env::var("PEERS").context("PEERS env variable must be set")?;
+    let peers = parse_peers(&peers).context("PEERS must be comma-separated u16 values")?;
+
+    Ok((node_id, peers))
+}
+
+/// Accept loop for Redis client connections.
+async fn serve_redis(server: Arc<Server>) -> Result<()> {
+    let listener = TcpListener::bind(REDIS_ADDR)
+        .await
+        .with_context(|| format!("failed to bind Redis listener on {REDIS_ADDR}"))?;
+    println!("Redis server listening on {REDIS_ADDR}");
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, _)) => {
+                tokio::spawn(handle_redis_connection(socket, server.clone()));
+            }
+            Err(e) => eprintln!("Failed to accept Redis connection: {e}"),
+        }
+    }
+}
+
+/// Accept loop for Raft peer connections.
+async fn serve_raft(server: Arc<Server>) -> Result<()> {
+    let listener = TcpListener::bind(RAFT_ADDR)
+        .await
+        .with_context(|| format!("failed to bind Raft listener on {RAFT_ADDR}"))?;
+    println!("Raft server listening on {RAFT_ADDR}");
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, _)) => {
+                tokio::spawn(handle_raft_connection(socket, server.raft.clone()));
+            }
+            Err(e) => eprintln!("Failed to accept Raft connection: {e}"),
+        }
+    }
+}
+
+/// Periodic heartbeat checker for the Raft node.
+async fn run_heartbeat_loop(node: Arc<Node>) -> Result<()> {
+    loop {
+        node.check_heartbeat().await;
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let addr = "0.0.0.0:6379";
-    let redis_listener = TcpListener::bind(addr).await?;
-    println!("Redis server listening on {addr}");
-
-    let store = Arc::new(Store::new());
-    tokio::spawn(async move {
-        loop {
-            let (socket, _) = redis_listener.accept().await.unwrap();
-            let store = store.clone();
-            tokio::spawn(handle_redis_connection(socket, store));
-        }
-    });
-
-    let node_id: u16 = env::var("NODE_ID")
-        .expect("NODE_ID env variable must be set")
-        .parse()
-        .expect("NODE_ID must be a valid u16");
-
+    let (node_id, peers) = load_config()?;
     println!("Starting node {node_id}");
 
-    let peers = env::var("PEERS").expect("Peers expected");
-    let peers = parse_peers(&peers).unwrap();
-    let cur_node = Node::new(node_id, peers);
+    let store = Arc::new(Store::new());
+    let node = Arc::new(Node::new(node_id, peers));
+    let raft_server = Arc::new(RaftServer::new(node.clone()));
+    let server = Arc::new(Server::new(store, raft_server));
 
-    let raft_addr = "0.0.0.0:6380";
-    let raft_listener = TcpListener::bind(raft_addr).await?;
-    let raft_server = Arc::new(RaftServer::new(cur_node));
-    loop {
-        let (socket, _) = raft_listener.accept().await?;
-        let raft_server = raft_server.clone();
-        tokio::spawn(handle_raft_connection(socket, raft_server));
-    }
+    tokio::try_join!(
+        serve_redis(server.clone()),
+        serve_raft(server),
+        run_heartbeat_loop(node),
+    )?;
+
+    Ok(())
 }

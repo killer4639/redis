@@ -107,15 +107,23 @@ impl Command {
     /// Executes the command with the given arguments against the store.
     /// Returns a RespValue response ready to send to the client.
     pub async fn execute(&self, args: &[RespValue], server: &Server) -> RespValue {
+        let id = server.raft.node.id;
         if self.is_write_command() {
             if !matches!(*server.raft.node.state.lock().await, NodeState::Leader) {
                 let leader = server.raft.node.current_leader.lock().await;
                 return match *leader {
-                    Some(id) => RespValue::Error(format!("MOVED node{id}:6379")),
-                    None => RespValue::Error("CLUSTERDOWN no leader elected".to_string()),
+                    Some(lid) => {
+                        println!("[N{id} redis] write redirect → N{lid}");
+                        RespValue::Error(format!("MOVED node{lid}:6379"))
+                    }
+                    None => {
+                        println!("[N{id} redis] write rejected — no leader");
+                        RespValue::Error("CLUSTERDOWN no leader elected".to_string())
+                    }
                 };
             }
             let raw_command = get_raw_command(self, args);
+            println!("[N{id} redis] write command: \"{raw_command}\"");
             match server.raft.append_log(&raw_command).await {
                 Ok(()) => {
                     // TODO: execute after Raft commit

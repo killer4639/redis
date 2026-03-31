@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use rand::Rng;
 
-pub const ELECTION_TIMEOUT_MIN: u64 = 150;
-pub const ELECTION_TIMEOUT_MAX: u64 = 300;
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+pub const ELECTION_TIMEOUT_MIN: u64 = 15000;
+pub const ELECTION_TIMEOUT_MAX: u64 = 30000;
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(5000);
 
 pub fn random_election_timeout() -> Duration {
     let millis = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN..=ELECTION_TIMEOUT_MAX);

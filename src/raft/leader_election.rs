@@ -24,6 +24,12 @@ impl LeaderElection {
             (ps.cur_term, idx, t)
         };
 
+        let id = node.id;
+        println!(
+            "[N{id} election] starting term={term} log=({last_log_term},{last_log_idx}) peers={:?}",
+            node.peers
+        );
+
         // Reset election timer
         *node.last_heartbeat.lock().await = Instant::now();
 
@@ -36,7 +42,7 @@ impl LeaderElection {
                 last_log_idx,
                 last_log_term,
             });
-            tasks.spawn(async move { send_raft_message(&message, peer).await });
+            tasks.spawn(async move { (peer, send_raft_message(&message, peer).await) });
         }
 
         // Count votes (starting at 1 for self-vote)
@@ -44,27 +50,45 @@ impl LeaderElection {
         let majority = (node.peers.len() + 1) / 2 + 1;
 
         while let Some(result) = tasks.join_next().await {
-            if let Ok(Ok(RaftMessage::RequestVoteResponse(resp))) = result {
-                // Step down if a peer has a higher term
-                if resp.term > term {
-                    let mut ps = node.persistent_state.lock().await;
-                    ps.cur_term = resp.term;
-                    ps.voted_for = None;
-                    drop(ps);
-                    *node.state.lock().await = NodeState::Follower;
-                    println!(
-                        "Node {} — aborting election, saw higher term {}",
-                        node.id, resp.term
-                    );
-                    tasks.abort_all();
-                    return Ok(false);
+            match result {
+                Ok((peer, Ok(RaftMessage::RequestVoteResponse(resp)))) => {
+                    // Step down if a peer has a higher term
+                    if resp.term > term {
+                        let mut ps = node.persistent_state.lock().await;
+                        ps.cur_term = resp.term;
+                        ps.voted_for = None;
+                        drop(ps);
+                        *node.state.lock().await = NodeState::Follower;
+                        println!(
+                            "[N{id} election] aborting — N{peer} has higher term {}",
+                            resp.term
+                        );
+                        tasks.abort_all();
+                        return Ok(false);
+                    }
+                    if resp.vote_granted && resp.term == term {
+                        votes += 1;
+                        println!("[N{id} election] vote granted by N{peer} ({votes}/{majority})");
+                    } else {
+                        println!("[N{id} election] vote denied by N{peer}");
+                    }
                 }
-                if resp.vote_granted && resp.term == term {
-                    votes += 1;
+                Ok((peer, Err(e))) => {
+                    println!("[N{id} election] N{peer} unreachable: {e}");
+                }
+                Ok((peer, _)) => {
+                    println!("[N{id} election] N{peer} unexpected response");
+                }
+                Err(e) => {
+                    println!("[N{id} election] task error: {e}");
                 }
             }
         }
 
+        println!(
+            "[N{id} election] result: {votes}/{majority} votes → {}",
+            if votes >= majority { "WON" } else { "LOST" }
+        );
         Ok(votes >= majority)
     }
 }

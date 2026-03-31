@@ -113,7 +113,10 @@ impl Node {
 
         if elapsed >= timeout {
             *self.state.lock().await = NodeState::Candidate;
-            println!("Node {} — election timeout, starting election", self.id);
+            println!(
+                "[N{} heartbeat] election timeout ({:.0?} >= {:.0?}), starting election",
+                self.id, elapsed, timeout
+            );
 
             match (LeaderElection {}).run_leader_election(self).await {
                 Ok(true) => {
@@ -137,10 +140,15 @@ impl Node {
 
                     *self.current_leader.lock().await = Some(self.id);
 
-                    println!("Node {} won election — became Leader", self.id);
+                    println!(
+                        "[N{} election] became Leader for term {} (next_idx initialized to {})",
+                        self.id,
+                        self.persistent_state.lock().await.cur_term,
+                        last_idx + 1
+                    );
                 }
-                Ok(false) => println!("Node {} lost election", self.id),
-                Err(e) => eprintln!("Node {} election error: {e}", self.id),
+                Ok(false) => println!("[N{} election] lost election", self.id),
+                Err(e) => eprintln!("[N{} election] error: {e}", self.id),
             }
         }
 
@@ -172,6 +180,11 @@ impl Node {
                 entries.last().unwrap().index
             };
 
+            println!(
+                "[N{} leader] → N{peer}: prev=({prev_log_index},{prev_log_term}) entries={} commit={commit_idx}",
+                self.id, entries.len()
+            );
+
             let message = RaftMessage::AppendEntries(AppendEntries {
                 term,
                 leader_id: self.id,
@@ -202,7 +215,7 @@ impl Node {
                     drop(ps);
                     *self.state.lock().await = NodeState::Follower;
                     println!(
-                        "Node {} stepped down — saw higher term {}",
+                        "[N{} leader] stepped down — N{peer} has term {}",
                         self.id, resp.term
                     );
                     return;
@@ -213,9 +226,18 @@ impl Node {
                 if resp.success {
                     state.match_idx.insert(peer, last_sent);
                     state.next_idx.insert(peer, last_sent + 1);
+                    println!(
+                        "[N{} leader] ← N{peer}: success, match_idx={last_sent} next_idx={}",
+                        self.id, last_sent + 1
+                    );
                 } else {
                     let next = state.next_idx.get(&peer).copied().unwrap_or(1);
-                    state.next_idx.insert(peer, next.saturating_sub(1).max(1));
+                    let new_next = next.saturating_sub(1).max(1);
+                    state.next_idx.insert(peer, new_next);
+                    println!(
+                        "[N{} leader] ← N{peer}: failed, next_idx {next} → {new_next}",
+                        self.id
+                    );
                 }
             }
         }
@@ -233,6 +255,10 @@ impl Node {
         if candidate > commit_idx && ps.log[candidate as usize - 1].term == term {
             self.volatile_state.lock().await.commit_idx = candidate;
             self.tx.send(candidate).unwrap();
+            println!(
+                "[N{} leader] commit advanced: {} → {} (match_idx={:?})",
+                self.id, commit_idx, candidate, all_match
+            );
         }
     }
 }

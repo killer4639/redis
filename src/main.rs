@@ -197,6 +197,14 @@ async fn apply_committed_entries(
 
         let applied_idx = node.volatile_state.lock().await.last_applied;
         let ps = node.persistent_state.lock().await;
+        let range_len = commit_idx as usize - applied_idx as usize;
+
+        if range_len > 0 {
+            println!(
+                "[N{} apply] applying entries {}..{} ({} entries)",
+                node.id, applied_idx + 1, commit_idx, range_len
+            );
+        }
 
         for entry in &ps.log[applied_idx as usize..commit_idx as usize] {
             let parts: Vec<&str> = entry.command.split_whitespace().collect();
@@ -206,6 +214,10 @@ async fn apply_committed_entries(
                     .map(|s| RespValue::BulkString(Some(s.to_string())))
                     .collect();
                 let _ = command.execute_inner(&args, &server.redis);
+                println!(
+                    "[N{} apply] applied index={} \"{}\"",
+                    node.id, entry.index, entry.command
+                );
             }
         }
         drop(ps);
@@ -217,7 +229,7 @@ async fn apply_committed_entries(
 #[tokio::main]
 async fn main() -> Result<()> {
     let (node_id, peers) = load_config()?;
-    println!("Starting node {node_id}");
+    println!("[N{node_id}] starting with peers={peers:?}");
 
     let (tx, rx) = tokio::sync::watch::channel(0u64);
 

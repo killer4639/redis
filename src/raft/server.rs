@@ -21,10 +21,11 @@ impl RaftServer {
 
     pub async fn append_log(&self, command: &str) -> Result<(), Error> {
         let mut ps = self.node.persistent_state.lock().await;
+        let cur_term = ps.cur_term.clone();
         let index = ps.log.last().map(|e| e.index).unwrap_or(0) + 1;
         ps.log.push(LogEntry {
             index,
-            term: ps.cur_term,
+            term: cur_term,
             command: command.to_string(),
         });
         Ok(())

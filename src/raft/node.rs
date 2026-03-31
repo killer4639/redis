@@ -40,7 +40,7 @@ pub struct Node {
     pub last_heartbeat: Arc<Mutex<Instant>>,
     pub persistent_state: Mutex<PersistentState>,
     pub volatile_state: Mutex<VolatileState>,
-    pub leader_volatile_state: Option<LeaderVolatileState>,
+    pub leader_volatile_state: Mutex<Option<LeaderVolatileState>>,
 }
 
 impl Node {
@@ -61,7 +61,7 @@ impl Node {
                 commit_idx: 0,
                 last_applied: 0,
             }),
-            leader_volatile_state: None,
+            leader_volatile_state: Mutex::new(None),
             peers,
         }
     }
@@ -113,6 +113,23 @@ impl Node {
             match (LeaderElection {}).run_leader_election(self).await {
                 Ok(true) => {
                     *self.state.lock().await = NodeState::Leader;
+                    let mut leader_volatile_state = LeaderVolatileState {
+                        next_idx: HashMap::new(),
+                        match_idx: HashMap::new(),
+                    };
+
+                    let last_idx = self.get_last_log_idx().await;
+                    for peer in &self.peers {
+                        leader_volatile_state
+                            .next_idx
+                            .insert(peer.clone(), last_idx + 1);
+
+                        leader_volatile_state.match_idx.insert(peer.clone(), 0);
+                    }
+
+                    let mut leader_vol_state_lock = self.leader_volatile_state.lock().await;
+                    *leader_vol_state_lock = Some(leader_volatile_state);
+
                     println!("Node {} won election — became Leader", self.id);
                 }
                 Ok(false) => println!("Node {} lost election", self.id),
@@ -126,23 +143,50 @@ impl Node {
     /// Sends empty AppendEntries (heartbeats) to all peers.
     /// Steps down if any peer responds with a higher term.
     async fn send_heartbeats(&self) {
-        let term = self.persistent_state.lock().await.cur_term;
+        let ps = self.persistent_state.lock().await;
+        let leader_state = self.leader_volatile_state.lock().await;
+        let term = ps.cur_term;
+        let commit_idx = self.volatile_state.lock().await.commit_idx;
 
         let mut tasks = JoinSet::new();
         for &peer in &self.peers {
+            let next = *leader_state.as_ref().unwrap().next_idx.get(&peer).unwrap();
+            let prev_log_index = next - 1;
+            let prev_log_term = if prev_log_index == 0 {
+                0
+            } else {
+                ps.log[prev_log_index as usize - 1].term
+            };
+            let entries = ps.log[prev_log_index as usize..].to_vec();
+
+            let last_sent_index = if entries.is_empty() {
+                prev_log_index
+            } else {
+                entries.last().unwrap().index
+            };
+
             let message = RaftMessage::AppendEntries(AppendEntries {
                 term,
                 leader_id: self.id,
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: vec![],
-                leader_commit: 0, // TODO: use actual commit index
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: commit_idx,
             });
-            tasks.spawn(async move { send_raft_message(&message, peer).await });
+            tasks.spawn(async move {
+                (
+                    peer,
+                    last_sent_index,
+                    send_raft_message(&message, peer).await,
+                )
+            });
         }
 
+        drop(ps);
+        drop(leader_state);
+
         while let Some(result) = tasks.join_next().await {
-            if let Ok(Ok(RaftMessage::AppendEntriesResponse(resp))) = result {
+            if let Ok((peer, last_sent, Ok(RaftMessage::AppendEntriesResponse(resp)))) = result {
                 if resp.term > term {
                     let mut ps = self.persistent_state.lock().await;
                     ps.cur_term = resp.term;
@@ -154,6 +198,16 @@ impl Node {
                         self.id, resp.term
                     );
                     return;
+                }
+
+                let mut ls = self.leader_volatile_state.lock().await;
+                let state = ls.as_mut().unwrap();
+                if resp.success {
+                    state.match_idx.insert(peer, last_sent);
+                    state.next_idx.insert(peer, last_sent + 1);
+                } else {
+                    let next = state.next_idx.get(&peer).copied().unwrap_or(1);
+                    state.next_idx.insert(peer, next.saturating_sub(1).max(1));
                 }
             }
         }

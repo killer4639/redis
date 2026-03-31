@@ -1,7 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::sync::watch::Receiver;
 
 /// Thread-safe in-memory key-value store.
 

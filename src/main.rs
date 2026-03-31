@@ -1,14 +1,12 @@
-mod cache;
 mod command;
 mod memory;
 mod raft;
 mod resp;
 mod utils;
 
-use std::{env, fs::soft_link, sync::Arc};
+use std::{env, sync::Arc};
 
 use anyhow::{Context, Result};
-use serde_json::ser;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -221,7 +219,7 @@ async fn main() -> Result<()> {
     let (node_id, peers) = load_config()?;
     println!("Starting node {node_id}");
 
-    let (tx, mut rx) = tokio::sync::watch::channel(0u64);
+    let (tx, rx) = tokio::sync::watch::channel(0u64);
 
     let store = Arc::new(Store::new());
     let node = Arc::new(Node::new(node_id, peers, tx));

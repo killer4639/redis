@@ -1,6 +1,6 @@
 use crate::Server;
 use crate::memory::{Store, StoreError};
-use crate::raft::node::{Node, NodeState};
+use crate::raft::node::NodeState;
 use crate::resp::RespValue;
 use std::time::Duration;
 
@@ -109,7 +109,11 @@ impl Command {
     pub async fn execute(&self, args: &[RespValue], server: &Server) -> RespValue {
         if self.is_write_command() {
             if !matches!(*server.raft.node.state.lock().await, NodeState::Leader) {
-                return RespValue::Error("Not the leader".to_string())
+                let leader = server.raft.node.current_leader.lock().await;
+                return match *leader {
+                    Some(id) => RespValue::Error(format!("MOVED node{id}:6379")),
+                    None => RespValue::Error("CLUSTERDOWN no leader elected".to_string()),
+                };
             }
             let raw_command = get_raw_command(self, args);
             match server.raft.append_log(&raw_command).await {
@@ -127,7 +131,7 @@ impl Command {
         }
     }
 
-    fn execute_inner(&self, args: &[RespValue], store: &Store) -> Result<RespValue, RespValue> {
+    pub fn execute_inner(&self, args: &[RespValue], store: &Store) -> Result<RespValue, RespValue> {
         match self {
             Self::Ping => Ok(RespValue::pong()),
 

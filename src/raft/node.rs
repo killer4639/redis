@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
+use tokio::sync::watch::Sender;
 use tokio::{sync::Mutex, task::JoinSet};
 
 use crate::{
@@ -41,10 +42,12 @@ pub struct Node {
     pub persistent_state: Mutex<PersistentState>,
     pub volatile_state: Mutex<VolatileState>,
     pub leader_volatile_state: Mutex<Option<LeaderVolatileState>>,
+    pub current_leader: Mutex<Option<u16>>,
+    pub tx: Sender<u64>,
 }
 
 impl Node {
-    pub fn new(id: u16, peers: Vec<u16>) -> Self {
+    pub fn new(id: u16, peers: Vec<u16>, tx: Sender<u64>) -> Self {
         let last_heartbeat = Arc::new(Mutex::new(Instant::now()));
         let state = Arc::new(Mutex::new(NodeState::Follower));
 
@@ -62,7 +65,9 @@ impl Node {
                 last_applied: 0,
             }),
             leader_volatile_state: Mutex::new(None),
+            current_leader: Mutex::new(None),
             peers,
+            tx,
         }
     }
 
@@ -130,6 +135,8 @@ impl Node {
                     let mut leader_vol_state_lock = self.leader_volatile_state.lock().await;
                     *leader_vol_state_lock = Some(leader_volatile_state);
 
+                    *self.current_leader.lock().await = Some(self.id);
+
                     println!("Node {} won election — became Leader", self.id);
                 }
                 Ok(false) => println!("Node {} lost election", self.id),
@@ -182,6 +189,7 @@ impl Node {
             });
         }
 
+        let last_log_idx = ps.log.last().map(|e| e.index).unwrap_or(0);
         drop(ps);
         drop(leader_state);
 
@@ -210,6 +218,21 @@ impl Node {
                     state.next_idx.insert(peer, next.saturating_sub(1).max(1));
                 }
             }
+        }
+
+        let ls = self.leader_volatile_state.lock().await;
+        let state = ls.as_ref().unwrap();
+        let mut all_match: Vec<u64> = state.match_idx.values().copied().collect();
+        all_match.push(last_log_idx); // leader has its own entries
+        all_match.sort_unstable_by(|a, b| b.cmp(a)); // descending
+
+        let majority_pos = (self.peers.len() + 1) / 2; // e.g. 3 nodes → pos 1
+        let candidate = all_match[majority_pos];
+
+        let ps = self.persistent_state.lock().await;
+        if candidate > commit_idx && ps.log[candidate as usize - 1].term == term {
+            self.volatile_state.lock().await.commit_idx = candidate;
+            self.tx.send(candidate).unwrap();
         }
     }
 }

@@ -70,7 +70,7 @@ impl RaftServer {
             return Ok(entries_response(ps.cur_term, false));
         }
 
-        self.accept_leader().await;
+        self.accept_leader(req.leader_id).await;
         let term = ps.cur_term;
 
         // Log consistency check (Raft §5.3)
@@ -87,6 +87,7 @@ impl RaftServer {
                 req.leader_commit,
                 ps.log.last().map(|e| e.index).unwrap_or(0),
             );
+            self.node.tx.send(vol.commit_idx).unwrap();
         }
 
         Ok(entries_response(term, true))
@@ -104,9 +105,10 @@ impl RaftServer {
     }
 
     /// Acknowledge a valid leader: reset heartbeat timer and become Follower.
-    async fn accept_leader(&self) {
+    async fn accept_leader(&self, leader_id: u16) {
         *self.node.last_heartbeat.lock().await = Instant::now();
         *self.node.state.lock().await = NodeState::Follower;
+        *self.node.current_leader.lock().await = Some(leader_id);
     }
 }
 

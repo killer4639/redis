@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::sync::watch::Receiver;
 
 /// Thread-safe in-memory key-value store.
 
@@ -264,7 +265,9 @@ impl Store {
         match data.get(key) {
             Some(entry) => match &entry.value {
                 RedisValue::List(list) => {
-                    let Some((start, stop)) = Self::normalize_lrange_bounds(list.len(), start, stop) else {
+                    let Some((start, stop)) =
+                        Self::normalize_lrange_bounds(list.len(), start, stop)
+                    else {
                         return Ok(Vec::new());
                     };
 
@@ -404,6 +407,5 @@ impl Store {
         }
 
         Some((start as usize, stop as usize))
-
     }
 }

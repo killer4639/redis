@@ -5,9 +5,10 @@ mod raft;
 mod resp;
 mod utils;
 
-use std::{env, sync::Arc};
+use std::{env, fs::soft_link, sync::Arc};
 
 use anyhow::{Context, Result};
+use serde_json::ser;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -187,20 +188,51 @@ async fn run_heartbeat_loop(node: Arc<Node>) -> Result<()> {
     }
 }
 
+async fn apply_committed_entries(
+    mut rx: tokio::sync::watch::Receiver<u64>,
+    server: Arc<Server>,
+) -> Result<()> {
+    loop {
+        rx.changed().await?;
+        let commit_idx = *rx.borrow();
+        let node = &server.raft.node;
+
+        let applied_idx = node.volatile_state.lock().await.last_applied;
+        let ps = node.persistent_state.lock().await;
+
+        for entry in &ps.log[applied_idx as usize..commit_idx as usize] {
+            let parts: Vec<&str> = entry.command.split_whitespace().collect();
+            if let Some(command) = Command::parse(parts[0]) {
+                let args: Vec<RespValue> = parts[1..]
+                    .iter()
+                    .map(|s| RespValue::BulkString(Some(s.to_string())))
+                    .collect();
+                let _ = command.execute_inner(&args, &server.redis);
+            }
+        }
+        drop(ps);
+
+        node.volatile_state.lock().await.last_applied = commit_idx;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let (node_id, peers) = load_config()?;
     println!("Starting node {node_id}");
 
+    let (tx, mut rx) = tokio::sync::watch::channel(0u64);
+
     let store = Arc::new(Store::new());
-    let node = Arc::new(Node::new(node_id, peers));
+    let node = Arc::new(Node::new(node_id, peers, tx));
     let raft_server = Arc::new(RaftServer::new(node.clone()));
-    let server = Arc::new(Server::new(store, raft_server));
+    let server = Arc::new(Server::new(store.clone(), raft_server));
 
     tokio::try_join!(
         serve_redis(server.clone()),
-        serve_raft(server),
-        run_heartbeat_loop(node),
+        serve_raft(server.clone()),
+        run_heartbeat_loop(node.clone()),
+        apply_committed_entries(rx, server.clone())
     )?;
 
     Ok(())

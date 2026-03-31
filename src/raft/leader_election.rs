@@ -1,3 +1,4 @@
+use crate::tlog;
 use std::time::Instant;
 
 use anyhow::Error;
@@ -25,7 +26,7 @@ impl LeaderElection {
         };
 
         let id = node.id;
-        println!(
+        tlog!(
             "[N{id} election] starting term={term} log=({last_log_term},{last_log_idx}) peers={:?}",
             node.peers
         );
@@ -59,7 +60,7 @@ impl LeaderElection {
                         ps.voted_for = None;
                         drop(ps);
                         *node.state.lock().await = NodeState::Follower;
-                        println!(
+                        tlog!(
                             "[N{id} election] aborting — N{peer} has higher term {}",
                             resp.term
                         );
@@ -68,24 +69,24 @@ impl LeaderElection {
                     }
                     if resp.vote_granted && resp.term == term {
                         votes += 1;
-                        println!("[N{id} election] vote granted by N{peer} ({votes}/{majority})");
+                        tlog!("[N{id} election] vote granted by N{peer} ({votes}/{majority})");
                     } else {
-                        println!("[N{id} election] vote denied by N{peer}");
+                        tlog!("[N{id} election] vote denied by N{peer}");
                     }
                 }
                 Ok((peer, Err(e))) => {
-                    println!("[N{id} election] N{peer} unreachable: {e}");
+                    tlog!("[N{id} election] N{peer} unreachable: {e}");
                 }
                 Ok((peer, _)) => {
-                    println!("[N{id} election] N{peer} unexpected response");
+                    tlog!("[N{id} election] N{peer} unexpected response");
                 }
                 Err(e) => {
-                    println!("[N{id} election] task error: {e}");
+                    tlog!("[N{id} election] task error: {e}");
                 }
             }
         }
 
-        println!(
+        tlog!(
             "[N{id} election] result: {votes}/{majority} votes → {}",
             if votes >= majority { "WON" } else { "LOST" }
         );

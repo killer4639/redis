@@ -41,7 +41,7 @@ async fn handle_redis_connection(mut socket: TcpStream, server: Arc<Server>) {
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or("unknown".into());
-    println!("Redis Client connected: {peer}");
+    tlog!("Redis Client connected: {peer}");
 
     let mut buf = [0u8; 512];
     loop {
@@ -61,7 +61,7 @@ async fn handle_redis_connection(mut socket: TcpStream, server: Arc<Server>) {
         }
     }
 
-    println!("Redis Client disconnected: {peer}");
+    tlog!("Redis Client disconnected: {peer}");
 }
 
 /// Handles a single raft connection.
@@ -71,7 +71,7 @@ async fn handle_raft_connection(mut socket: TcpStream, raft_server: Arc<RaftServ
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or("unknown".into());
-    println!("Raft Client connected: {peer}");
+    tlog!("Raft Client connected: {peer}");
 
     let mut buf = [0u8; 512];
     loop {
@@ -84,7 +84,7 @@ async fn handle_raft_connection(mut socket: TcpStream, raft_server: Arc<RaftServ
         let raft_message: RaftMessage = match serde_json::from_slice(&buf[..bytes_read]) {
             Ok(msg) => msg,
             Err(e) => {
-                eprintln!("Invalid Raft message from {peer}: {e}");
+                tlog!("Invalid Raft message from {peer}: {e}");
                 continue;
             }
         };
@@ -92,7 +92,7 @@ async fn handle_raft_connection(mut socket: TcpStream, raft_server: Arc<RaftServ
         let response = match raft_server.process_request(raft_message).await {
             Ok(resp) => resp,
             Err(e) => {
-                eprintln!("Error processing Raft message from {peer}: {e}");
+                tlog!("Error processing Raft message from {peer}: {e}");
                 continue;
             }
         };
@@ -105,7 +105,7 @@ async fn handle_raft_connection(mut socket: TcpStream, raft_server: Arc<RaftServ
         }
     }
 
-    println!("Raft Client disconnected: {peer}");
+    tlog!("Raft Client disconnected: {peer}");
 }
 
 /// Parses and executes a single RESP request.
@@ -150,14 +150,14 @@ async fn serve_redis(server: Arc<Server>) -> Result<()> {
     let listener = TcpListener::bind(REDIS_ADDR)
         .await
         .with_context(|| format!("failed to bind Redis listener on {REDIS_ADDR}"))?;
-    println!("Redis server listening on {REDIS_ADDR}");
+    tlog!("Redis server listening on {REDIS_ADDR}");
 
     loop {
         match listener.accept().await {
             Ok((socket, _)) => {
                 tokio::spawn(handle_redis_connection(socket, server.clone()));
             }
-            Err(e) => eprintln!("Failed to accept Redis connection: {e}"),
+            Err(e) => tlog!("Failed to accept Redis connection: {e}"),
         }
     }
 }
@@ -167,14 +167,14 @@ async fn serve_raft(server: Arc<Server>) -> Result<()> {
     let listener = TcpListener::bind(RAFT_ADDR)
         .await
         .with_context(|| format!("failed to bind Raft listener on {RAFT_ADDR}"))?;
-    println!("Raft server listening on {RAFT_ADDR}");
+    tlog!("Raft server listening on {RAFT_ADDR}");
 
     loop {
         match listener.accept().await {
             Ok((socket, _)) => {
                 tokio::spawn(handle_raft_connection(socket, server.raft.clone()));
             }
-            Err(e) => eprintln!("Failed to accept Raft connection: {e}"),
+            Err(e) => tlog!("Failed to accept Raft connection: {e}"),
         }
     }
 }
@@ -200,7 +200,7 @@ async fn apply_committed_entries(
         let range_len = commit_idx as usize - applied_idx as usize;
 
         if range_len > 0 {
-            println!(
+            tlog!(
                 "[N{} apply] applying entries {}..{} ({} entries)",
                 node.id, applied_idx + 1, commit_idx, range_len
             );
@@ -214,7 +214,7 @@ async fn apply_committed_entries(
                     .map(|s| RespValue::BulkString(Some(s.to_string())))
                     .collect();
                 let _ = command.execute_inner(&args, &server.redis);
-                println!(
+                tlog!(
                     "[N{} apply] applied index={} \"{}\"",
                     node.id, entry.index, entry.command
                 );
@@ -229,7 +229,7 @@ async fn apply_committed_entries(
 #[tokio::main]
 async fn main() -> Result<()> {
     let (node_id, peers) = load_config()?;
-    println!("[N{node_id}] starting with peers={peers:?}");
+    tlog!("[N{node_id}] starting with peers={peers:?}");
 
     let (tx, rx) = tokio::sync::watch::channel(0u64);
 

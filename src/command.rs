@@ -1,3 +1,4 @@
+use crate::tlog;
 use crate::Server;
 use crate::memory::{Store, StoreError};
 use crate::raft::node::NodeState;
@@ -113,17 +114,17 @@ impl Command {
                 let leader = server.raft.node.current_leader.lock().await;
                 return match *leader {
                     Some(lid) => {
-                        println!("[N{id} redis] write redirect → N{lid}");
+                        tlog!("[N{id} redis] write redirect → N{lid}");
                         RespValue::Error(format!("MOVED node{lid}:6379"))
                     }
                     None => {
-                        println!("[N{id} redis] write rejected — no leader");
+                        tlog!("[N{id} redis] write rejected — no leader");
                         RespValue::Error("CLUSTERDOWN no leader elected".to_string())
                     }
                 };
             }
             let raw_command = get_raw_command(self, args);
-            println!("[N{id} redis] write command: \"{raw_command}\"");
+            tlog!("[N{id} redis] write command: \"{raw_command}\"");
             match server.raft.append_log(&raw_command).await {
                 Ok(()) => {
                     // TODO: execute after Raft commit

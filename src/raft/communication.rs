@@ -5,6 +5,8 @@ use tokio::{
     net::TcpStream,
 };
 
+use crate::utils::RPC_TIMEOUT;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LogEntry {
     pub index: u64,
@@ -51,20 +53,27 @@ pub enum RaftMessage {
     AppendEntriesResponse(AppendEntriesResponse),
 }
 
-
 const RAFT_PORT: u16 = 6380;
 
 /// Sends a Raft message to a peer and reads back the response.
 pub async fn send_raft_message(message: &RaftMessage, node_id: u16) -> Result<RaftMessage, Error> {
     let addr = format!("node{node_id}:{RAFT_PORT}");
-    let mut stream = TcpStream::connect(&addr).await?;
 
-    let payload = serde_json::to_vec(message)?;
-    stream.write_all(&payload).await?;
-    stream.shutdown().await?;
+    let fut = async {
+        let mut stream = TcpStream::connect(&addr).await?;
+        let payload = serde_json::to_vec(message)?;
+        stream.write_all(&payload).await?;
+        stream.shutdown().await?;
 
-    let mut response_buf = Vec::new();
-    stream.read_to_end(&mut response_buf).await?;
-    let response: RaftMessage = serde_json::from_slice(&response_buf)?;
-    Ok(response)
+        let mut response_buf = Vec::new();
+        stream.read_to_end(&mut response_buf).await?;
+        let response: Result<RaftMessage, Error> =
+            serde_json::from_slice(&response_buf).map_err(Error::from);
+        response
+    };
+
+    match tokio::time::timeout(RPC_TIMEOUT, fut).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("RPC to node{node_id} timed out after {RPC_TIMEOUT:?}"),
+    }
 }

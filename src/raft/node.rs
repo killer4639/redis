@@ -1,3 +1,4 @@
+use crate::tlog;
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use tokio::sync::watch::Sender;
@@ -113,7 +114,7 @@ impl Node {
 
         if elapsed >= timeout {
             *self.state.lock().await = NodeState::Candidate;
-            println!(
+            tlog!(
                 "[N{} heartbeat] election timeout ({:.0?} >= {:.0?}), starting election",
                 self.id, elapsed, timeout
             );
@@ -137,18 +138,20 @@ impl Node {
 
                     let mut leader_vol_state_lock = self.leader_volatile_state.lock().await;
                     *leader_vol_state_lock = Some(leader_volatile_state);
+                    drop(leader_vol_state_lock);
 
                     *self.current_leader.lock().await = Some(self.id);
 
-                    println!(
+                    tlog!(
                         "[N{} election] became Leader for term {} (next_idx initialized to {})",
                         self.id,
                         self.persistent_state.lock().await.cur_term,
                         last_idx + 1
                     );
+                    self.send_heartbeats().await;
                 }
-                Ok(false) => println!("[N{} election] lost election", self.id),
-                Err(e) => eprintln!("[N{} election] error: {e}", self.id),
+                Ok(false) => tlog!("[N{} election] lost election", self.id),
+                Err(e) => tlog!("[N{} election] error: {e}", self.id),
             }
         }
 
@@ -158,13 +161,17 @@ impl Node {
     /// Sends empty AppendEntries (heartbeats) to all peers.
     /// Steps down if any peer responds with a higher term.
     async fn send_heartbeats(&self) {
+        tlog!("[N{} Heartbeat] Sending heartbeats", self.id);
         let ps = self.persistent_state.lock().await;
+        tlog!("[N{} Heartbeat] Got PS lock", self.id);
         let leader_state = self.leader_volatile_state.lock().await;
+        tlog!("[N{} Heartbeat] Got LVS lock", self.id);
         let term = ps.cur_term;
         let commit_idx = self.volatile_state.lock().await.commit_idx;
 
         let mut tasks = JoinSet::new();
         for &peer in &self.peers {
+            tlog!("[N{} Heartbeat] Sending heartbeat to N{}", self.id, peer);
             let next = *leader_state.as_ref().unwrap().next_idx.get(&peer).unwrap();
             let prev_log_index = next - 1;
             let prev_log_term = if prev_log_index == 0 {
@@ -180,9 +187,10 @@ impl Node {
                 entries.last().unwrap().index
             };
 
-            println!(
+            tlog!(
                 "[N{} leader] → N{peer}: prev=({prev_log_index},{prev_log_term}) entries={} commit={commit_idx}",
-                self.id, entries.len()
+                self.id,
+                entries.len()
             );
 
             let message = RaftMessage::AppendEntries(AppendEntries {
@@ -214,7 +222,7 @@ impl Node {
                     ps.voted_for = None;
                     drop(ps);
                     *self.state.lock().await = NodeState::Follower;
-                    println!(
+                    tlog!(
                         "[N{} leader] stepped down — N{peer} has term {}",
                         self.id, resp.term
                     );
@@ -226,15 +234,16 @@ impl Node {
                 if resp.success {
                     state.match_idx.insert(peer, last_sent);
                     state.next_idx.insert(peer, last_sent + 1);
-                    println!(
+                    tlog!(
                         "[N{} leader] ← N{peer}: success, match_idx={last_sent} next_idx={}",
-                        self.id, last_sent + 1
+                        self.id,
+                        last_sent + 1
                     );
                 } else {
                     let next = state.next_idx.get(&peer).copied().unwrap_or(1);
                     let new_next = next.saturating_sub(1).max(1);
                     state.next_idx.insert(peer, new_next);
-                    println!(
+                    tlog!(
                         "[N{} leader] ← N{peer}: failed, next_idx {next} → {new_next}",
                         self.id
                     );
@@ -255,7 +264,7 @@ impl Node {
         if candidate > commit_idx && ps.log[candidate as usize - 1].term == term {
             self.volatile_state.lock().await.commit_idx = candidate;
             self.tx.send(candidate).unwrap();
-            println!(
+            tlog!(
                 "[N{} leader] commit advanced: {} → {} (match_idx={:?})",
                 self.id, commit_idx, candidate, all_match
             );

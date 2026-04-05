@@ -1,18 +1,11 @@
-use std::num::ParseIntError;
-use tokio::time::{Duration};
+use anyhow::{Context, Result};
+use std::{env, num::ParseIntError, sync::atomic::AtomicU64, time::Duration};
 
-use rand::Rng;
-
-pub const ELECTION_TIMEOUT_MIN: u64 = 15000;
-pub const ELECTION_TIMEOUT_MAX: u64 = 30000;
+pub const ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(15000);
+pub const ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(30000);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(5000);
 
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(2);
-
-pub fn random_election_timeout() -> Duration {
-    let millis = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MIN..=ELECTION_TIMEOUT_MAX);
-    Duration::from_millis(millis)
-}
 
 pub fn timestamp() -> String {
     let d = std::time::SystemTime::now()
@@ -38,10 +31,25 @@ macro_rules! tlog {
     }};
 }
 
-pub fn parse_peers(peers_string: &str) -> Result<Vec<u16>, ParseIntError> {
+pub fn parse_peers(peers_string: &str) -> Result<Vec<usize>, ParseIntError> {
     peers_string
         .split(',')
         .filter(|s| !s.is_empty())
-        .map(|s| s.trim().parse::<u16>())
+        .map(|s| s.trim().parse::<usize>())
         .collect()
 }
+
+/// Parse node configuration from environment variables.
+pub fn load_config() -> Result<(usize, Vec<usize>)> {
+    let node_id: usize = env::var("NODE_ID")
+        .context("NODE_ID env variable must be set")?
+        .parse()
+        .context("NODE_ID must be a valid u16")?;
+
+    let peers = env::var("PEERS").context("PEERS env variable must be set")?;
+    let peers = parse_peers(&peers).context("PEERS must be comma-separated u16 values")?;
+
+    Ok((node_id, peers))
+}
+
+pub const UNIQUE_ID: AtomicU64 = AtomicU64::new(0);

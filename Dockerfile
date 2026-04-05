@@ -9,6 +9,10 @@ WORKDIR /app
 
 RUN apk add --no-cache clang lld musl-dev git
 
+COPY little-raft /little-raft
+COPY redis/src /app/src
+COPY redis/Cargo.toml redis/Cargo.lock /app/
+
 RUN --mount=type=bind,source=src,target=src \
     --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
     --mount=type=bind,source=Cargo.lock,target=Cargo.lock \

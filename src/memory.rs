@@ -29,8 +29,6 @@ impl Entry {
     }
 }
 
-/// The Mutex is inside the struct so callers just need `&self`.
-/// Wrap in `Arc` to share across async tasks.
 pub struct Store {
     data: Mutex<HashMap<String, Entry>>,
 }

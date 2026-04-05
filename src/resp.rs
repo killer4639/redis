@@ -1,6 +1,7 @@
 use std::fmt;
 
 /// Represents a value in the Redis Serialization Protocol (RESP).
+#[derive(Debug)]
 pub enum RespValue {
     SimpleString(String),
     Error(String),
@@ -114,7 +115,10 @@ impl RespValue {
 
         let length = length as usize;
         let data = std::str::from_utf8(&buf[header_len..header_len + length]).unwrap();
-        (Self::BulkString(Some(data.to_string())), header_len + length + 2)
+        (
+            Self::BulkString(Some(data.to_string())),
+            header_len + length + 2,
+        )
     }
 
     fn parse_array(buf: &[u8]) -> (Self, usize) {

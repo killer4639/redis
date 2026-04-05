@@ -1,42 +1,47 @@
+mod cluster;
 mod command;
+mod engine;
 mod memory;
-mod raft;
+mod message_bus;
+mod node;
 mod resp;
 mod utils;
 
-use std::{env, sync::Arc};
-
-use anyhow::{Context, Result};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+use std::{
+    io::{Read, Write},
     net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+    thread, u64,
 };
 
+use anyhow::{Context, Result};
+use little_raft::replica::Replica;
+
 use crate::{
+    cluster::{MessageType, RedisCluster, RedisTransition},
     command::Command,
-    memory::Store,
-    raft::{communication::RaftMessage, node::Node, server::RaftServer},
+    engine::Engine,
+    message_bus::MessageBus,
+    node::Redis,
     resp::RespValue,
-    utils::parse_peers,
+    utils::{
+        ELECTION_TIMEOUT_MAX, ELECTION_TIMEOUT_MIN, HEARTBEAT_INTERVAL, UNIQUE_ID, load_config,
+    },
 };
 
 const REDIS_ADDR: &str = "0.0.0.0:6379";
 const RAFT_ADDR: &str = "0.0.0.0:6380";
 
-pub struct Server {
-    pub redis: Arc<Store>,
-    pub raft: Arc<RaftServer>,
-}
-
-impl Server {
-    pub fn new(redis: Arc<Store>, raft: Arc<RaftServer>) -> Self {
-        Self { redis, raft }
-    }
-}
-
 /// Handles a single client connection.
 /// Reads commands in a loop until the client disconnects.
-async fn handle_redis_connection(mut socket: TcpStream, server: Arc<Server>) {
+fn handle_redis_connection(
+    mut socket: TcpStream,
+    message_bus: Arc<MessageBus<RedisTransition>>,
+    engine: Arc<Engine>,
+    node: Arc<Mutex<Redis>>,
+    node_id: usize,
+    leader_id: Arc<Mutex<Option<usize>>>,
+) {
     let peer = socket
         .peer_addr()
         .map(|a| a.to_string())
@@ -45,19 +50,46 @@ async fn handle_redis_connection(mut socket: TcpStream, server: Arc<Server>) {
 
     let mut buf = [0u8; 512];
     loop {
-        let bytes_read = match socket.read(&mut buf).await {
+        let bytes_read = match socket.read(&mut buf) {
             Ok(0) => break, // client disconnected
             Ok(n) => n,
             Err(_) => break, // read error, drop connection
         };
 
-        let response = process_redis_request(&buf[..bytes_read], &server).await;
-        if socket
-            .write_all(response.to_string().as_bytes())
-            .await
-            .is_err()
-        {
-            break; // write error, drop connection
+        let command = String::from_utf8(buf[..bytes_read].to_vec()).unwrap();
+        let command_id = (node_id as u64 * 100000
+            + UNIQUE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+
+        let Some(parsed) = Command::parse_str(&command) else {
+            let response = RespValue::Error("Invalid command format".to_string());
+            let _ = socket.write_all(response.to_string().as_bytes());
+            continue;
+        };
+
+        if parsed.is_write_command() {
+            // Redirect to leader if we're not the leader
+            let current_leader = *leader_id.lock().unwrap();
+            if current_leader != Some(node_id) {
+                let response = match current_leader {
+                    Some(lid) => RespValue::Error(format!("MOVED node{lid}:6379")),
+                    None => RespValue::Error("CLUSTERDOWN no leader elected".to_string()),
+                };
+                let _ = socket.write_all(response.to_string().as_bytes());
+                continue;
+            }
+
+            let msg: RedisTransition = RedisTransition::new(command_id, command);
+
+            let (tx, rx) = crossbeam_channel::unbounded();
+            node.lock().unwrap().pending.insert(command_id, tx);
+            message_bus.push(msg);
+
+            let response = rx.recv().unwrap();
+            node.lock().unwrap().pending.remove(&command_id);
+            socket.write_all(response.as_bytes()).unwrap();
+        } else {
+            let response = engine.execute(&command);
+            socket.write_all(response.as_bytes()).unwrap()
         }
     }
 
@@ -66,184 +98,126 @@ async fn handle_redis_connection(mut socket: TcpStream, server: Arc<Server>) {
 
 /// Handles a single raft connection.
 /// Reads commands in a loop until the client disconnects.
-async fn handle_raft_connection(mut socket: TcpStream, raft_server: Arc<RaftServer>) {
+fn handle_raft_connection(mut socket: TcpStream, message_bus: Arc<MessageBus<MessageType>>) {
     let peer = socket
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or("unknown".into());
     tlog!("Raft Client connected: {peer}");
 
-    let mut buf = [0u8; 512];
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
     loop {
-        let bytes_read = match socket.read(&mut buf).await {
-            Ok(0) => break, // client disconnected
+        let bytes_read = match socket.read(&mut tmp) {
+            Ok(0) => break,
             Ok(n) => n,
-            Err(_) => break, // read error, drop connection
+            Err(_) => break,
         };
+        buf.extend_from_slice(&tmp[..bytes_read]);
 
-        let raft_message: RaftMessage = match serde_json::from_slice(&buf[..bytes_read]) {
+        let msg: MessageType = match serde_json::from_slice(&buf) {
             Ok(msg) => msg,
-            Err(e) => {
-                tlog!("Invalid Raft message from {peer}: {e}");
-                continue;
-            }
+            Err(_) => continue, // incomplete message, keep reading
         };
 
-        let response = match raft_server.process_request(raft_message).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                tlog!("Error processing Raft message from {peer}: {e}");
-                continue;
-            }
-        };
-        if socket
-            .write_all(&serde_json::to_vec(&response).unwrap())
-            .await
-            .is_err()
-        {
-            break; // write error, drop connection
-        }
+        buf.clear();
+        message_bus.push(msg);
     }
 
     tlog!("Raft Client disconnected: {peer}");
 }
 
-/// Parses and executes a single RESP request.
-async fn process_redis_request(buf: &[u8], server: &Server) -> RespValue {
-    let request = RespValue::deserialize(buf);
-
-    let RespValue::Array(Some(items)) = request else {
-        return RespValue::err("invalid command format");
-    };
-
-    if items.is_empty() {
-        return RespValue::err("empty command");
-    }
-
-    let Some(command_name) = items[0].as_str() else {
-        return RespValue::err("invalid command name");
-    };
-
-    let Some(command) = Command::parse(command_name) else {
-        return RespValue::err(&format!("unknown command '{command_name}'"));
-    };
-
-    // items[0] is the command name, the rest are arguments
-    command.execute(&items[1..], server).await
-}
-
-/// Parse node configuration from environment variables.
-fn load_config() -> Result<(u16, Vec<u16>)> {
-    let node_id: u16 = env::var("NODE_ID")
-        .context("NODE_ID env variable must be set")?
-        .parse()
-        .context("NODE_ID must be a valid u16")?;
-
-    let peers = env::var("PEERS").context("PEERS env variable must be set")?;
-    let peers = parse_peers(&peers).context("PEERS must be comma-separated u16 values")?;
-
-    Ok((node_id, peers))
-}
-
 /// Accept loop for Redis client connections.
-async fn serve_redis(server: Arc<Server>) -> Result<()> {
+fn serve_redis(
+    message_bus: Arc<MessageBus<RedisTransition>>,
+    engine: Arc<Engine>,
+    node: Arc<Mutex<Redis>>,
+    node_id: usize,
+    leader_id: Arc<Mutex<Option<usize>>>,
+) {
     let listener = TcpListener::bind(REDIS_ADDR)
-        .await
-        .with_context(|| format!("failed to bind Redis listener on {REDIS_ADDR}"))?;
+        .with_context(|| format!("failed to bind Redis listener on {REDIS_ADDR}"))
+        .unwrap();
     tlog!("Redis server listening on {REDIS_ADDR}");
 
-    loop {
-        match listener.accept().await {
-            Ok((socket, _)) => {
-                tokio::spawn(handle_redis_connection(socket, server.clone()));
+    thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    let message_bus = message_bus.clone();
+                    let engine = engine.clone();
+                    let node = node.clone();
+                    let leader_id = leader_id.clone();
+                    thread::spawn(move || {
+                        handle_redis_connection(socket, message_bus, engine, node, node_id, leader_id)
+                    });
+                }
+                Err(e) => tlog!("Failed to accept Redis connection: {e}"),
             }
-            Err(e) => tlog!("Failed to accept Redis connection: {e}"),
         }
-    }
+    });
 }
 
 /// Accept loop for Raft peer connections.
-async fn serve_raft(server: Arc<Server>) -> Result<()> {
+fn serve_raft(message_bus: Arc<MessageBus<MessageType>>) {
     let listener = TcpListener::bind(RAFT_ADDR)
-        .await
-        .with_context(|| format!("failed to bind Raft listener on {RAFT_ADDR}"))?;
+        .with_context(|| format!("failed to bind Raft listener on {RAFT_ADDR}"))
+        .unwrap();
     tlog!("Raft server listening on {RAFT_ADDR}");
+    let message_bus = message_bus.clone();
 
-    loop {
-        match listener.accept().await {
-            Ok((socket, _)) => {
-                tokio::spawn(handle_raft_connection(socket, server.raft.clone()));
-            }
-            Err(e) => tlog!("Failed to accept Raft connection: {e}"),
-        }
-    }
-}
-
-/// Periodic heartbeat checker for the Raft node.
-async fn run_heartbeat_loop(node: Arc<Node>) -> Result<()> {
-    loop {
-        node.check_heartbeat().await;
-    }
-}
-
-async fn apply_committed_entries(
-    mut rx: tokio::sync::watch::Receiver<u64>,
-    server: Arc<Server>,
-) -> Result<()> {
-    loop {
-        rx.changed().await?;
-        let commit_idx = *rx.borrow();
-        let node = &server.raft.node;
-
-        let applied_idx = node.volatile_state.lock().await.last_applied;
-        let ps = node.persistent_state.lock().await;
-        let range_len = commit_idx as usize - applied_idx as usize;
-
-        if range_len > 0 {
-            tlog!(
-                "[N{} apply] applying entries {}..{} ({} entries)",
-                node.id, applied_idx + 1, commit_idx, range_len
-            );
-        }
-
-        for entry in &ps.log[applied_idx as usize..commit_idx as usize] {
-            let parts: Vec<&str> = entry.command.split_whitespace().collect();
-            if let Some(command) = Command::parse(parts[0]) {
-                let args: Vec<RespValue> = parts[1..]
-                    .iter()
-                    .map(|s| RespValue::BulkString(Some(s.to_string())))
-                    .collect();
-                let _ = command.execute_inner(&args, &server.redis);
-                tlog!(
-                    "[N{} apply] applied index={} \"{}\"",
-                    node.id, entry.index, entry.command
-                );
+    thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((socket, _)) => {
+                    let message_bus = message_bus.clone();
+                    thread::spawn(move || handle_raft_connection(socket, message_bus));
+                }
+                Err(e) => tlog!("Failed to accept Raft connection: {e}"),
             }
         }
-        drop(ps);
-
-        node.volatile_state.lock().await.last_applied = commit_idx;
-    }
+    });
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let (node_id, peers) = load_config()?;
     tlog!("[N{node_id}] starting with peers={peers:?}");
+    let (raft_sender, raft_receiver) = crossbeam_channel::unbounded();
+    let raft_message_bus = MessageBus::new(Mutex::new(Vec::new()), raft_sender);
+    let raft_message_bus = Arc::new(raft_message_bus);
 
-    let (tx, rx) = tokio::sync::watch::channel(0u64);
+    let leader_id: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+    let cluster = Arc::new(Mutex::new(RedisCluster::new(raft_message_bus.clone(), leader_id.clone())));
 
-    let store = Arc::new(Store::new());
-    let node = Arc::new(Node::new(node_id, peers, tx));
-    let raft_server = Arc::new(RaftServer::new(node.clone()));
-    let server = Arc::new(Server::new(store.clone(), raft_server));
+    let (redis_sender, redis_receiver) = crossbeam_channel::unbounded();
+    let redis_message_bus = MessageBus::new(Mutex::new(Vec::new()), redis_sender);
+    let redis_message_bus = Arc::new(redis_message_bus);
 
-    tokio::try_join!(
-        serve_redis(server.clone()),
-        serve_raft(server.clone()),
-        run_heartbeat_loop(node.clone()),
-        apply_committed_entries(rx, server.clone())
-    )?;
+    let engine = Arc::new(Engine::new());
+    let node = Redis::new(engine.clone(), redis_message_bus.clone());
+    let state_machine = Arc::new(Mutex::new(node));
+    let noop_transition = RedisTransition::new(u64::MAX, "PING".to_string());
+
+    serve_raft(raft_message_bus.clone());
+    serve_redis(
+        redis_message_bus.clone(),
+        engine.clone(),
+        state_machine.clone(),
+        node_id,
+        leader_id.clone(),
+    );
+
+    Replica::new(
+        node_id,
+        peers,
+        cluster,
+        state_machine,
+        0 as usize,
+        noop_transition,
+        HEARTBEAT_INTERVAL,
+        (ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX),
+    )
+    .start(raft_receiver, redis_receiver);
 
     Ok(())
 }

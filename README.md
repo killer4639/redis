@@ -2,7 +2,7 @@
 
 I built a Redis clone from scratch in Rust, then made it distributed using the Raft consensus algorithm.
 
-No libraries for the hard parts. No `raft-rs`. Just the paper, Tokio, and a lot of debugging Docker logs.
+Uses [little-raft](https://github.com/andreev-io/little-raft) for the Raft state machine, but all the networking, protocol handling, and cluster wiring is hand-written.
 
 ## What it does
 
@@ -15,8 +15,9 @@ It's a key-value store that replicates across multiple nodes. Kill the leader, a
 - Log replication with consistency checks
 - Commit index advancement (majority quorum)
 - Automatic failover — kill a node, cluster keeps going
-- Follower redirect (`-MOVED`) for write commands
+- Leader tracking — followers know who the leader is and redirect writes with `-MOVED`
 - Heartbeats to maintain leader authority
+- Graceful error handling — malformed commands and down peers don't crash nodes
 
 ## Architecture
 
@@ -37,6 +38,14 @@ Each node runs two TCP servers:
 Writes go to the leader → appended to the Raft log → replicated to followers → committed once a majority acknowledges → applied to the in-memory store.
 
 Reads can go to any node (eventual consistency).
+
+## Key design decisions
+
+- **Command as a self-contained object** — each `Command` enum variant carries its `Vec<RespValue>` arguments, so a parsed command owns everything needed to execute or serialize it for Raft replication.
+- **Non-blocking Raft RPCs** — `send_message` uses connect timeouts and silently drops failures (per the Cluster trait contract). Peers going down won't block or crash the sender.
+- **Leader redirect before Raft** — write commands hitting a follower get a `-MOVED` response immediately, before entering the Raft pipeline. This avoids unnecessary `Abandoned(NotLeader)` round-trips.
+- **Growable Raft message buffer** — the Raft connection handler accumulates reads into a `Vec<u8>` instead of a fixed-size buffer, so large `AppendEntries` messages with many log entries won't get truncated.
+- **Cooperative thread shutdown** — the cluster uses an `AtomicBool` halt flag checked via `recv_timeout`, allowing clean thread termination without orphaned blocking calls.
 
 ## How it works
 
@@ -77,15 +86,17 @@ docker compose logs -f
 
 ## The stack
 
-- **Rust** with **Tokio** for async networking
-- **serde/serde_json** for Raft message serialization
-- **Docker Compose** for running the cluster
+- **Rust** — systems language, no GC
+- **little-raft** — Raft consensus state machine
+- **crossbeam** — lock-free message passing between threads
+- **serde/serde_json** — Raft message serialization
+- **Docker Compose** — running the cluster
 - Hand-written RESP protocol parser
-- Hand-written Raft implementation (following the [Raft paper](https://raft.github.io/raft.pdf))
+- Hand-written TCP networking for both Redis and Raft protocols
 
 ## What I learned
 
 - Distributed consensus is mostly about edge cases. The happy path is easy — it's the "what if the leader dies mid-replication" scenarios that get you.
-- Async Rust + Mutexes is a puzzle. Holding locks across `.await` points and avoiding deadlocks took real thought.
+- Every `.unwrap()` in a distributed system is a crash waiting to happen. Peers go down, messages get truncated, channels get dropped. Handle all of it.
 - Docker Compose is surprisingly good for testing distributed systems locally.
 - Reading the Raft paper is one thing. Implementing it is a completely different experience. You don't really understand the protocol until you've debugged an election storm at 2am.

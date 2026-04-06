@@ -13,14 +13,11 @@ COPY little-raft /little-raft
 COPY redis/src /app/src
 COPY redis/Cargo.toml redis/Cargo.lock /app/
 
-RUN --mount=type=bind,source=src,target=src \
-    --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
-    --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
-    --mount=type=cache,target=/app/target/ \
+RUN --mount=type=cache,target=/app/target/ \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/usr/local/cargo/registry/ \
-cargo build --locked --release && \
-cp ./target/release/$APP_NAME /bin/server
+    cargo build --locked --release && \
+    cp ./target/release/redis /bin/server
 
 FROM alpine:3.18 AS final
 

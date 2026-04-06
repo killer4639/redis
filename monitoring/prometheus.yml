@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "redis-raft"
+    static_configs:
+      - targets: ["node1:9090"]
+        labels:
+          node: "node1"
+      - targets: ["node2:9090"]
+        labels:
+          node: "node2"
+      - targets: ["node3:9090"]
+        labels:
+          node: "node3"
+      - targets: ["node4:9090"]
+        labels:
+          node: "node4"
+      - targets: ["node5:9090"]
+        labels:
+          node: "node5"

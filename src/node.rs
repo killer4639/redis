@@ -10,7 +10,8 @@ use little_raft::state_machine::{
 };
 
 use crate::{
-    cluster::RedisTransition, engine::Engine, message_bus::MessageBus, resp::RespValue, tlog,
+    cluster::RedisTransition, engine::Engine, message_bus::MessageBus, metrics, resp::RespValue,
+    tlog,
 };
 
 type PendingResponses = HashMap<u64, Sender<String>>;
@@ -38,9 +39,15 @@ impl StateMachine<RedisTransition, Vec<u8>> for Redis {
         transition_id: <RedisTransition as StateMachineTransition>::TransitionID,
         state: TransitionState,
     ) {
+        // Skip noop transitions from metrics
+        if transition_id == u64::MAX {
+            return;
+        }
+
         match state {
             TransitionState::Abandoned(TransitionAbandonedReason::NotLeader)
             | TransitionState::Abandoned(TransitionAbandonedReason::ConflictWithLeader) => {
+                metrics::RAFT_TRANSITIONS_ABANDONED.inc();
                 let response = RespValue::Error("Error".to_string());
                 if let Some(tx) = self.pending.remove(&transition_id) {
                     let _ = tx.send(response.to_string());
@@ -55,6 +62,9 @@ impl StateMachine<RedisTransition, Vec<u8>> for Redis {
                     tlog!("Registered Sender not found for {}", transition_id)
                 }
             }
+            TransitionState::Committed => {
+                metrics::RAFT_TRANSITIONS_COMMITTED.inc();
+            }
             _ => {}
         }
     }
@@ -65,6 +75,7 @@ impl StateMachine<RedisTransition, Vec<u8>> for Redis {
             return;
         }
 
+        metrics::RAFT_TRANSITIONS_APPLIED.inc();
         let result = self.engine.execute(&transition.command);
         if self.pending.contains_key(&transition.get_id()) {
             self.results.insert(transition.get_id(), result);
@@ -84,7 +95,9 @@ impl StateMachine<RedisTransition, Vec<u8>> for Redis {
     }
 
     fn get_pending_transitions(&mut self) -> Vec<RedisTransition> {
-        self.message_bus.drain()
+        let transitions = self.message_bus.drain();
+        metrics::RAFT_PENDING_TRANSITIONS.set(transitions.len() as i64);
+        transitions
     }
     fn get_snapshot(&mut self) -> Option<Snapshot<Vec<u8>>> {
         None

@@ -6,12 +6,15 @@ mod message_bus;
 mod node;
 mod resp;
 mod utils;
+mod metrics;
 
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{Arc, Mutex},
-    thread, u64,
+    thread,
+    time::Instant,
+    u64,
 };
 
 use anyhow::{Context, Result};
@@ -22,6 +25,7 @@ use crate::{
     command::Command,
     engine::Engine,
     message_bus::MessageBus,
+    metrics::{ConnectionGuard},
     node::Redis,
     resp::RespValue,
     utils::{
@@ -47,6 +51,7 @@ fn handle_redis_connection(
         .map(|a| a.to_string())
         .unwrap_or("unknown".into());
     tlog!("Redis Client connected: {peer}");
+    let _conn_guard = ConnectionGuard::new();
 
     let mut buf = [0u8; 512];
     loop {
@@ -66,10 +71,17 @@ fn handle_redis_connection(
             continue;
         };
 
+        metrics::REDIS_COMMANDS_TOTAL
+            .with_label_values(&[parsed.name()])
+            .inc();
+
         if parsed.is_write_command() {
+            metrics::REDIS_WRITE_COMMANDS.inc();
+
             // Redirect to leader if we're not the leader
             let current_leader = *leader_id.lock().unwrap();
             if current_leader != Some(node_id) {
+                metrics::REDIS_REDIRECTS.inc();
                 let response = match current_leader {
                     Some(lid) => RespValue::Error(format!("MOVED node{lid}:6379")),
                     None => RespValue::Error("CLUSTERDOWN no leader elected".to_string()),
@@ -78,6 +90,7 @@ fn handle_redis_connection(
                 continue;
             }
 
+            let timer = Instant::now();
             let msg: RedisTransition = RedisTransition::new(command_id, command);
 
             let (tx, rx) = crossbeam_channel::unbounded();
@@ -85,10 +98,15 @@ fn handle_redis_connection(
             message_bus.push(msg);
 
             let response = rx.recv().unwrap();
+            metrics::REDIS_COMMAND_DURATION.observe(timer.elapsed().as_secs_f64());
             node.lock().unwrap().pending.remove(&command_id);
             socket.write_all(response.as_bytes()).unwrap();
         } else {
+            metrics::REDIS_READ_COMMANDS.inc();
+
+            let timer = Instant::now();
             let response = engine.execute(&command);
+            metrics::REDIS_COMMAND_DURATION.observe(timer.elapsed().as_secs_f64());
             socket.write_all(response.as_bytes()).unwrap()
         }
     }
@@ -187,7 +205,7 @@ fn main() -> Result<()> {
     let raft_message_bus = Arc::new(raft_message_bus);
 
     let leader_id: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
-    let cluster = Arc::new(Mutex::new(RedisCluster::new(raft_message_bus.clone(), leader_id.clone())));
+    let cluster = Arc::new(Mutex::new(RedisCluster::new(node_id, raft_message_bus.clone(), leader_id.clone())));
 
     let (redis_sender, redis_receiver) = crossbeam_channel::unbounded();
     let redis_message_bus = MessageBus::new(Mutex::new(Vec::new()), redis_sender);
@@ -206,6 +224,9 @@ fn main() -> Result<()> {
         node_id,
         leader_id.clone(),
     );
+    metrics::register_metrics();
+    metrics::NODE_INFO.set(node_id as i64);
+    metrics::serve_metrics();
 
     Replica::new(
         node_id,

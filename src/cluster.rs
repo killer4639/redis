@@ -9,6 +9,7 @@ use little_raft::{cluster::Cluster, state_machine::StateMachineTransition};
 use serde::{Deserialize, Serialize};
 
 use crate::message_bus::MessageBus;
+use crate::metrics;
 use crate::utils::RPC_TIMEOUT;
 
 const RAFT_PORT: u16 = 6380;
@@ -36,6 +37,7 @@ impl StateMachineTransition for RedisTransition {
 pub type MessageType = Message<RedisTransition, Vec<u8>>;
 
 pub struct RedisCluster {
+    node_id: usize,
     message_bus: Arc<MessageBus<MessageType>>,
     halted: Arc<AtomicBool>,
     leader_id: Arc<Mutex<Option<ReplicaID>>>,
@@ -43,11 +45,13 @@ pub struct RedisCluster {
 
 impl RedisCluster {
     pub fn new(
+        node_id: usize,
         message_bus: Arc<MessageBus<MessageType>>,
         leader_id: Arc<Mutex<Option<ReplicaID>>>,
     ) -> Self {
         let halted = Arc::new(AtomicBool::new(false));
         Self {
+            node_id,
             message_bus,
             halted,
             leader_id,
@@ -71,10 +75,13 @@ impl Cluster<RedisTransition, Vec<u8>> for RedisCluster {
         if stream.write_all(&payload).is_err() {
             return;
         }
+        metrics::RAFT_MESSAGES_SENT.inc();
     }
 
     fn receive_messages(&mut self) -> Vec<MessageType> {
-        self.message_bus.drain()
+        let messages = self.message_bus.drain();
+        metrics::RAFT_MESSAGES_RECEIVED.inc_by(messages.len() as u64);
+        messages
     }
 
     fn halt(&self) -> bool {
@@ -82,6 +89,22 @@ impl Cluster<RedisTransition, Vec<u8>> for RedisCluster {
     }
 
     fn register_leader(&mut self, leader_id: Option<ReplicaID>) {
-        *self.leader_id.lock().unwrap() = leader_id;
+        let mut guard= self.leader_id.lock().unwrap();
+        if *guard != leader_id {
+            metrics::RAFT_LEADER_CHANGES.inc();
+        }
+
+        *guard = leader_id;
+
+        match leader_id {
+            Some(id) => {
+                metrics::RAFT_CURRENT_LEADER.set(id as i64);
+                metrics::RAFT_IS_LEADER.set(if id == self.node_id { 1 } else { 0 });
+            }
+            None => {
+                metrics::RAFT_CURRENT_LEADER.set(-1);
+                metrics::RAFT_IS_LEADER.set(0);
+            }
+        }
     }
 }
